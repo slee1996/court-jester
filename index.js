@@ -1,12 +1,18 @@
 require("dotenv").config();
 const { Configuration, OpenAIApi } = require("openai");
+const {
+  runJestTests,
+  extractCodeFromString,
+  generateDynamicTestFile,
+  getFunctionName,
+  runCodeInIsolatedVm,
+} = require("./lib");
 const Koa = require("koa");
 const cors = require("@koa/cors");
 const Router = require("@koa/router");
 const bodyParser = require("koa-bodyparser");
-const { spawn } = require("child_process");
 const fs = require("fs");
-const path = require("path");
+const glob = require("glob");
 
 const configuration = new Configuration({
   organization: process.env.OPEN_AI_ORG_KEY,
@@ -34,41 +40,11 @@ app.use(async (ctx, next) => {
   ctx.set("X-Response-Time", `${ms}ms`);
 });
 
-function testToRun(fnToTest) {
-  return test("1 + 1 should equal 2", () => {
-    expect(1 + 1).toBe(2);
-  });
-}
-
-function extractCodeFromString(str) {
-  const codeBlockRegex = /```(?:\w*\n)?([\s\S]*?)```/g;
-  const match = codeBlockRegex.exec(str);
-  return match && match[1] ? match[1] : null;
-}
-
-async function runJestTests() {
-  return new Promise((resolve, reject) => {
-    const jestProcess = spawn("yarn", ["test"]);
-
-    jestProcess.stdout.on("data", (data) => {
-      console.log(`stdout: ${data}`);
-    });
-
-    jestProcess.stderr.on("data", (data) => {
-      console.error(`stderr: ${data}`);
-    });
-
-    jestProcess.on("close", (code) => {
-      console.log(`child process exited with code ${code}`);
-      resolve(code);
-    });
-  });
-}
-
 async function promptGpt(storyPrompt) {
   try {
     const completion = await openai.createChatCompletion({
       model: "gpt-3.5-turbo",
+      n: 2,
       messages: [
         {
           role: "system",
@@ -84,40 +60,55 @@ async function promptGpt(storyPrompt) {
   }
 }
 
-function generateDynamicTestFile(testFileName, functionName, fnToTest) {
-  const testCode = `const ${functionName} = ${fnToTest}; 
-    test('${functionName} should work as expected', () => { 
-      expect(${functionName}(1, 1)).toBe(2);
-    });`;
-
-  if (fs.existsSync(testFileName)) {
-    fs.unlinkSync(testFileName);
-  }
-
-  fs.writeFileSync(testFileName, testCode, "utf8");
-}
-
-function getFunctionsFromModule(module) {
-  return Object.entries(module)
-    .filter(([key, value]) => typeof value === "function")
-    .map(([key, value]) => key);
-}
-
 // routes
 router.post("/", async (ctx) => {
-  const chat = await promptGpt(ctx.request.body.prompt);
-  const extractedCode = extractCodeFromString(chat[0].message.content);
-  const functionCodeWithExport = `${extractedCode}\nmodule.exports = { ${
-    extractedCode.match(/function\s+(\w+)/)[1]
-  } };`;
+  try {
+    const chats = await promptGpt(ctx.request.body.prompt);
+    const generatedFunctions = new Set();
 
-  eval(extractedCode);
-  fs.writeFileSync("sumFunction.js", functionCodeWithExport, "utf8");
-  generateDynamicTestFile("sum.test.js", "sum", extractedCode);
+    chats.slice(0, 9).forEach(async (chat, i) => {
+      const extractedCode = extractCodeFromString(chat.message.content);
+      const functionName = getFunctionName(extractedCode);
 
-  await runJestTests();
+      generatedFunctions.add(functionName);
 
-  ctx.body = chat;
+      const start = Date.now();
+
+      console.log(`Start running ${functionName}-${i} in isolated vm-${i}`);
+
+      await runCodeInIsolatedVm(extractedCode).catch((err) => {
+        throw err;
+      });
+      const ms = Date.now() - start;
+
+      console.log(
+        `End running ${functionName}-${i} in isolated vm-${i}`,
+        ms + "ms"
+      );
+
+      const functionCodeWithExport = `${extractedCode}\nmodule.exports = { ${
+        extractedCode.match(/function\s+(\w+)/)[1]
+      } };`;
+
+      fs.writeFileSync(
+        `${functionName}${i}.js`,
+        functionCodeWithExport,
+        "utf8"
+      );
+      generateDynamicTestFile(
+        `${functionName}${i}.test.js`,
+        functionName,
+        extractedCode
+      );
+    });
+
+    await runJestTests();
+
+    ctx.body = chats;
+  } catch (err) {
+    console.error(err);
+    ctx.body = err;
+  }
 });
 
 // response
